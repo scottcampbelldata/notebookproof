@@ -6,14 +6,7 @@ of reproducibility. The install name and import name are both `notebookproof`.
 
 ## Install
 
-The PyPI release is being prepared. Until it is published, install from GitHub
-(this command requires Git):
-
-```python
-%pip install git+https://github.com/scottcampbelldata/notebookproof.git
-```
-
-After publication, the standard command will be:
+In a notebook cell:
 
 ```python
 %pip install notebookproof
@@ -80,7 +73,7 @@ unsupported unhashable object columns get an explicit skipped-check finding.
 
 ## Optional fresh-kernel execution
 
-Install the execution extra after the PyPI release:
+Install the execution extra:
 
 ```python
 %pip install "notebookproof[verify]"

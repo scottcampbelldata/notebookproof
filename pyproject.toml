@@ -3,7 +3,7 @@ requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "notebook-lintel"
+name = "notebookproof"
 version = "0.1.0"
 description = "Check a Jupyter notebook and a dataframe from inside the notebook."
 readme = "README.md"
@@ -21,8 +21,8 @@ classifiers = [
 dependencies = []
 
 [project.urls]
-Homepage = "https://github.com/scottcampbelldata/notebook-lintel"
-Repository = "https://github.com/scottcampbelldata/notebook-lintel"
+Homepage = "https://github.com/scottcampbelldata/notebookproof"
+Repository = "https://github.com/scottcampbelldata/notebookproof"
 
 [tool.setuptools]
-py-modules = ["lintel"]
+py-modules = ["notebookproof"]

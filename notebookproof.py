@@ -1,11 +1,10 @@
 """Check a notebook and a dataframe from inside Jupyter.
 
-    %pip install git+https://github.com/scottcampbelldata/notebook-lintel.git
-    import lintel
-    lintel.check()
-    lintel.frame(df)
+    %pip install git+https://github.com/scottcampbelldata/notebookproof.git
+    import notebookproof
+    notebookproof.check()
+    notebookproof.frame(df)
 
-`pip install lintel` is a different package. This one is named notebook-lintel.
 Save the notebook before check(). frame() looks at a table already in memory.
 """
 
@@ -397,7 +396,7 @@ def analyze_table(headers, rows, truncated=False):
 
 
 def _print_notebook(report):
-    print(f"Lintel notebook  {report['score']}/100  {report['verdict']}")
+    print(f"notebookproof  {report['score']}/100  {report['verdict']}")
     if report.get("where"):
         print(report["where"])
     print(report["headline"])
@@ -419,7 +418,7 @@ def _print_notebook(report):
 
 
 def _print_table(report):
-    print(f"Lintel table  {report['score']}/100  {report['verdict']}  {report['rows']} rows × {report['cols']} cols")
+    print(f"notebookproof  {report['score']}/100  {report['verdict']}  {report['rows']} rows × {report['cols']} cols")
     print(report["headline"])
     print()
     if not report["findings"]:
@@ -444,7 +443,7 @@ def _load_notebook(path):
     if found is None:
         raise RuntimeError(
             "Jupyter did not tell the kernel which file this is. "
-            "Save the notebook, then call check('your-notebook.ipynb'). "
+            "Save the notebook, then call notebookproof.check('your-notebook.ipynb'). "
             "frame(df) does not need the file."
         )
     return json.loads(Path(found).read_text(encoding="utf-8")), f"Read {Path(found).name}. Save first if you just edited it."

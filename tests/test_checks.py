@@ -1,8 +1,8 @@
-import lintel
+import notebookproof
 
 
 def test_notebook_catches_order_and_forward_ref():
-    report = lintel.analyze_notebook({
+    report = notebookproof.analyze_notebook({
         "cells": [
             {"cell_type": "code", "execution_count": 4, "source": "print(df.head())\nmodel.fit(X, y)"},
             {"cell_type": "code", "execution_count": 1, "source": "import pandas as pd\ndf = pd.read_csv('sales.csv')\nX = df.drop(columns=['y'])\ny = df['y']"},
@@ -19,7 +19,7 @@ def test_notebook_catches_order_and_forward_ref():
 
 
 def test_clean_notebook():
-    report = lintel.analyze_notebook({
+    report = notebookproof.analyze_notebook({
         "cells": [
             {"cell_type": "code", "execution_count": 1, "source": "import pandas as pd\ndf = pd.DataFrame({'a':[1]})"},
             {"cell_type": "code", "execution_count": 2, "source": "print(len(df))"},
@@ -37,8 +37,8 @@ def test_table_flags():
 4,40,40,yes,2024-04-04
 5,50,50,yes,2024-05-05
 """
-    headers, rows, truncated = lintel.parse_table(text)
-    report = lintel.analyze_table(headers, rows, truncated)
+    headers, rows, truncated = notebookproof.parse_table(text)
+    report = notebookproof.analyze_table(headers, rows, truncated)
     codes = [f["code"] for f in report["findings"]]
     assert "DUP_KEY" in codes
     assert "DUP_ROWS" in codes

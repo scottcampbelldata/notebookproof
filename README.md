@@ -99,8 +99,8 @@ that old and new outputs match; output equivalence is not compared.
 
 ## Try it and give feedback
 
-Open [the five-minute trial notebook](examples/quickstart.ipynb) in the notebook
-environment you already use. The [trial questions](docs/user-trial.md) cover
+Open [the five-minute trial notebook](https://github.com/scottcampbelldata/notebookproof/blob/main/examples/quickstart.ipynb) in the notebook
+environment you already use. The [trial questions](https://github.com/scottcampbelldata/notebookproof/blob/main/docs/user-trial.md) cover
 whether the first useful finding arrives quickly and whether you would use
 the checker again. Adoption has not yet been measured.
 
@@ -114,7 +114,7 @@ python -m twine check dist/*
 ```
 
 GitHub Actions checks Windows and Linux on Python 3.9 and 3.14.
-[Publishing setup](docs/publishing.md) describes the PyPI trusted publisher;
+[Publishing setup](https://github.com/scottcampbelldata/notebookproof/blob/main/docs/publishing.md) describes the PyPI trusted publisher;
 no long-lived PyPI upload token is required.
 
 Version 0.2 removes the old `score` and `verdict` fields. Use individual findings,

@@ -20,7 +20,7 @@ from decimal import Decimal
 from numbers import Real
 from pathlib import Path
 
-__version__ = "0.2.0"
+__version__ = "0.2.1"
 AMBIENT = set(dir(builtins)) | {"get_ipython", "display", "__name__", "__file__", "In", "Out"}
 
 

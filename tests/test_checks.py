@@ -1,3 +1,5 @@
+import pandas as pd
+
 import notebookproof
 
 
@@ -25,23 +27,21 @@ def test_clean_notebook():
             {"cell_type": "code", "execution_count": 2, "source": "print(len(df))"},
         ]
     })
-    assert report["verdict"] == "clean"
+    assert report["findings"] == []
+    assert report["executed"] is False
 
 
 def test_table_flags():
-    text = """id,revenue,revenue_copy,flag,signup
-1,10,10,yes,2024-01-01
-1,10,10,yes,2024-01-01
-2,20,20,yes,later
-3,30,30,yes,2024-03-03
-4,40,40,yes,2024-04-04
-5,50,50,yes,2024-05-05
-"""
-    headers, rows, truncated = notebookproof.parse_table(text)
-    report = notebookproof.analyze_table(headers, rows, truncated)
+    df = pd.DataFrame({
+        'id': [1, 1, 2, 3, 4, 5], 'revenue': [10, 10, 20, 30, 40, 50],
+        'revenue_copy': [10, 10, 20, 30, 40, 50], 'flag': ['yes'] * 6,
+        'signup': [pd.Timestamp('2024-01-01'), pd.Timestamp('2024-01-01'),
+                   'later', pd.Timestamp('2024-03-03'), pd.Timestamp('2024-04-04'), pd.Timestamp('2024-05-05')],
+    })
+    report = notebookproof.frame(df, keys=['id'])
     codes = [f["code"] for f in report["findings"]]
     assert "DUP_KEY" in codes
     assert "DUP_ROWS" in codes
-    assert "CORRELATED" in codes
+    assert "COPY_COLUMN" in codes
     assert "CONSTANT" in codes
     assert "MIXED" in codes

@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "notebookproof"
-version = "0.1.0"
-description = "Check a Jupyter notebook and a dataframe from inside the notebook."
+version = "0.2.0"
+description = "Notebook preflight and DataFrame health checks inside Jupyter."
 readme = "README.md"
 requires-python = ">=3.9"
 license = "MIT"
@@ -19,6 +19,10 @@ classifiers = [
   "Programming Language :: Python :: 3",
 ]
 dependencies = []
+
+[project.optional-dependencies]
+verify = ["nbclient>=0.10", "ipykernel>=6"]
+test = ["pytest>=7", "pandas>=1.5", "polars>=0.20", "nbclient>=0.10", "ipykernel>=6"]
 
 [project.urls]
 Homepage = "https://github.com/scottcampbelldata/notebookproof"

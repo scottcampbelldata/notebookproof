@@ -8,6 +8,8 @@ from __future__ import annotations
 import ast
 import builtins
 import csv
+import copy
+import html
 import io
 import json
 import math
@@ -20,16 +22,51 @@ from decimal import Decimal
 from numbers import Real
 from pathlib import Path
 
-__version__ = "0.2.1"
+__version__ = "0.3.0"
 AMBIENT = set(dir(builtins)) | {"get_ipython", "display", "__name__", "__file__", "In", "Out"}
 
 
-def check(path=None):
-    """Inspect notebook code and metadata; no notebook cells are executed."""
-    nb, where = _load_notebook(path)
+def check(path=None, *, run=False, timeout=60, kernel_name=None, details=False):
+    """Preflight saved code; run=True also executes and compares in a fresh kernel."""
+    if type(run) is not bool:
+        raise ValueError("run must be True or False.")
+    nb, where, file = _load_notebook(path)
     report = analyze_notebook(nb)
     report["where"] = where
-    _print_notebook(report)
+    if run:
+        if file is None:
+            raise ValueError("Save a local .ipynb and pass its path for a fresh-kernel check.")
+        execution = verify(file, timeout=timeout, kernel_name=kernel_name, details=details)
+        report["execution"] = execution
+        report["executed"] = execution["executed"]
+        report["headline"] = "Preflight and fresh-run evidence; review changes and inspection gaps below."
+        if not execution.get('skipped') and execution['sourceStatus'] != 'unchanged':
+            report['findings'].append(_finding('error', 'SOURCE_CHANGED', 'Source notebook changed or could not be reread',
+                'Results refer to the saved snapshot. Inspect the current file; no restoration was attempted.'))
+        finished = {c['cell'] - 1 for c in execution['outputComparisons']
+                    if c['status'] not in {'failed', 'not_run', 'skipped'}}
+        for finding in report['findings']:
+            if finding['code'] == 'SAVED_ERROR' and finding.get('cell') in finished:
+                finding.update(severity='info', title='An old saved error did not recur',
+                    detail='This cell completed in the fresh run. Its saved error belongs to an earlier run.')
+            elif finding['code'] == 'SYNTAX_ERROR' and finding.get('cell') in finished:
+                finding.update(severity='info', title='Static parsing failed, but fresh execution completed',
+                    detail='The static parser could not inspect this cell. The selected kernel accepted it; check parser/kernel version differences and notebook commands.')
+        if not execution.get('skipped') and not execution['succeeded']:
+            cell = execution['failedCell']
+            report['findings'].append(_finding('error', 'FRESH_RUN_FAILED',
+                f"Fresh execution failed: {execution['errorName']}",
+                'Review this cell and its required inputs or environment. Use details=True for the execution error.',
+                **({'cell': cell - 1} if cell else {})))
+        for comparison in execution['outputComparisons']:
+            if comparison['status'] == 'changed':
+                report['findings'].append(_finding('warn', 'OUTPUT_CHANGED', 'Fresh output differs from the saved result',
+                    comparison['detail'], cell=comparison['cell'] - 1))
+        if not execution['comparisonComplete']:
+            report['findings'].append(_finding('info', 'COMPARISON_GAPS', 'Some results were not fully compared',
+                'See the per-cell comparison: missing baselines, unsupported output types, ignored cells or execution failures are disclosed.'))
+        report['findings'].sort(key=lambda f: ({'error': 0, 'warn': 1, 'info': 2}[f['severity']], f.get('cell', -1)))
+    _print_notebook(report, details=details)
     return report
 
 
@@ -38,18 +75,22 @@ def notebook(path):
     return check(path)
 
 
-def verify(path, *, timeout=60, kernel_name=None):
+def verify(path, *, timeout=60, kernel_name=None, compare_outputs=True, details=False):
     """Execute saved code in a fresh kernel, without writing the notebook.
 
     This runs the notebook's side effects with your normal permissions: it is
-    not a sandbox. timeout is per cell. Outputs are not compared with old ones.
+    not a sandbox. timeout is per cell. Supported saved output payloads are compared,
+    without execution counts or display metadata. This does not prove correctness.
     Install notebookproof[verify] to enable this optional check.
     """
     if type(timeout) is not int or timeout < 1:
         raise ValueError("timeout must be a positive integer in seconds.")
+    if type(compare_outputs) is not bool:
+        raise ValueError("compare_outputs must be True or False.")
     if os.environ.get("NOTEBOOKPROOF_VERIFY_ACTIVE") == "1":
         print("Nested verify() skipped: a fresh-kernel check is already running.")
-        return dict(executed=False, skipped=True, outputsCompared=False)
+        return dict(executed=False, skipped=True, succeeded=None, outputsCompared=False,
+                    comparisonComplete=False, outputsMatch=None, outputComparisons=[])
     file = Path(path).expanduser().resolve()
     if not file.is_file():
         raise FileNotFoundError(f"No notebook at {file}.")
@@ -58,36 +99,130 @@ def verify(path, *, timeout=60, kernel_name=None):
         from nbclient import NotebookClient
     except ImportError as exc:
         raise ImportError("Install notebookproof[verify] to run a fresh-kernel check.") from exc
-    nb = nbformat.reads(file.read_text(encoding="utf-8-sig"), as_version=4)
+    source_bytes = file.read_bytes()
+    nb = nbformat.reads(source_bytes.decode("utf-8-sig"), as_version=4)
+    before = copy.deepcopy(nb)
     selected = kernel_name or nb.metadata.get("kernelspec", {}).get("name") or "python3"
-    current = None
+    current, started = None, set()
 
     def starting(*, cell, cell_index):
         nonlocal current
         current = cell_index + 1
+        started.add(cell_index)
 
     client = NotebookClient(nb, timeout=timeout, kernel_name=selected,
         force_raise_errors=True, resources={"metadata": {"path": str(file.parent)}},
-        on_cell_start=starting)
+        on_cell_execute=starting)
     error = None
     try:
         client.execute(env=dict(os.environ, NOTEBOOKPROOF_VERIFY_ACTIVE="1"))
     except Exception as exc:
         error = exc
-    report = dict(executed=current is not None, succeeded=error is None,
-        outputsCompared=False, kernelName=selected, failedCell=current if error else None,
+    try:
+        source_status = 'unchanged' if file.read_bytes() == source_bytes else 'changed'
+    except OSError:
+        source_status = 'unreadable'
+    comparisons = _compare_outputs(before, nb, started, current if error else None, compare_outputs)
+    compared = any(c['status'] in {'matched', 'changed', 'partial'} for c in comparisons)
+    complete = bool(comparisons) and all(c['status'] in {'matched', 'changed'} and not c.get('unsupported') for c in comparisons)
+    changed = any(c['status'] == 'changed' for c in comparisons)
+    report = dict(executed=bool(started), succeeded=error is None, sourceStatus=source_status,
+        outputsCompared=compared, comparisonComplete=complete,
+        outputsMatch=False if changed else True if complete else None,
+        outputComparisons=comparisons, kernelName=selected, failedCell=current if error else None,
         errorName=getattr(error, "ename", type(error).__name__) if error else None,
         error=str(error)[:2000] if error else None,
-        limitations=["Output equivalence and reproducibility were not verified.",
+        limitations=["Payload comparison is exact, not a test of scientific correctness or semantic equivalence.",
+            "Timestamps, floating-point formatting, HTML identifiers and image encoding can legitimately change.",
+            "Widgets and unrecognised MIME types are not compared; all comparison gaps are listed.",
             "Code runs with normal permissions and may modify files or call external services.",
             "Nested verify() calls are skipped to prevent recursive kernel creation."])
     if error:
         print(f"Fresh-kernel execution failed at cell {current or '?'}: {report['errorName']}")
-        print(report["error"])
+        if details:
+            print(report["error"])
     else:
         print(f"Fresh-kernel execution completed using {selected}.")
-    print("Original notebook was not written. Output equivalence was not compared.")
+    counts = {status: sum(c['status'] == status for c in comparisons) for status in sorted({c['status'] for c in comparisons})}
+    print('Outputs: ' + (', '.join(f'{count} {status}' for status, count in counts.items()) or 'no comparable code cells'))
+    if details:
+        for comparison in comparisons:
+            print(f"cell {comparison['cell']}: {comparison['status']} — {comparison['detail']}")
+    print(f"Source file after execution: {source_status}. Inspect comparison gaps; matching payloads do not prove correctness.")
     return report
+
+
+def _output_payloads(outputs):
+    supported = {'text/plain', 'text/html', 'text/markdown', 'text/latex',
+                 'application/json', 'image/png', 'image/jpeg', 'image/svg+xml'}
+    payloads, unsupported, formats, streams = [], set(), set(), {}
+
+    def text(value):
+        return (''.join(value) if isinstance(value, list) else value).replace('\r\n', '\n')
+
+    def flush():
+        if streams:
+            payloads.append(('stream', dict(streams)))
+            streams.clear()
+
+    for output in outputs:
+        kind = output.get('output_type')
+        if kind == 'stream':
+            name = output.get('name', 'stdout')
+            formats.add(name)
+            streams[name] = streams.get(name, '') + text(output.get('text', ''))
+            continue
+        flush()
+        if kind in {'display_data', 'execute_result'}:
+            data = output.get('data', {})
+            unsupported.update(set(data) - supported)
+            values = {}
+            for mime in sorted(set(data) & supported):
+                value = data[mime]
+                if mime == 'application/json':
+                    value = json.dumps(value, sort_keys=True, separators=(',', ':'), ensure_ascii=False)
+                else:
+                    value = text(value)
+                    if mime in {'image/png', 'image/jpeg'}:
+                        value = ''.join(value.split())
+                values[mime] = value
+                formats.add(mime)
+            if values:
+                payloads.append(('display', values))
+        elif kind == 'error':
+            formats.add('error')
+            payloads.append(('error', output.get('ename'), output.get('evalue')))
+        else:
+            unsupported.add(str(kind))
+    flush()
+    return payloads, sorted(unsupported), sorted(formats)
+
+
+def _compare_outputs(before, after, started, failed_cell, enabled):
+    comparisons = []
+    for index, (old, new) in enumerate(zip(before.cells, after.cells)):
+        if old.cell_type != 'code' or not old.source.strip():
+            continue
+        result = dict(cell=index + 1)
+        tags = old.metadata.get('tags', [])
+        if index not in started:
+            result.update(status='skipped' if 'skip-execution' in tags else 'not_run', detail='This code cell was not executed.')
+        elif index + 1 == failed_cell:
+            result.update(status='failed', detail='Execution failed here; its output was not compared.')
+        elif not enabled or 'notebookproof-ignore-output' in tags or old.source.lstrip().startswith('# notebookproof-ignore-output'):
+            result.update(status='ignored', detail='Output comparison was explicitly disabled; the code still executed.')
+        elif old.execution_count is None and not old.outputs:
+            result.update(status='no_baseline', detail='No saved execution count or output is available as a comparison baseline.')
+        else:
+            old_payload, old_unknown, old_formats = _output_payloads(old.outputs)
+            new_payload, new_unknown, new_formats = _output_payloads(new.outputs)
+            unknown = sorted(set(old_unknown + new_unknown))
+            status = 'changed' if old_payload != new_payload else 'partial' if unknown and (old_payload or new_payload) else 'unsupported' if unknown else 'matched'
+            result.update(status=status, unsupported=unknown, mimeTypes=sorted(set(old_formats + new_formats)),
+                detail='Saved and fresh supported payloads ' + ('differ; review whether the change is expected.' if status == 'changed' else 'match.')
+                    + (' Not compared: ' + ', '.join(unknown) + '.' if unknown else ''))
+        comparisons.append(result)
+    return comparisons
 
 
 def _finding(severity, code, title, detail, **where):
@@ -155,7 +290,7 @@ def analyze_notebook(nb):
         for name in cell["deferred"]:
             cell["reads"].append({"name": name, "from": (owners.get(name) or [None])[0], "deferred": True})
             if name not in owners and name not in AMBIENT:
-                findings.append(_finding("info" if dynamic else "warn", "UNDEFINED", f"Check the deferred reference to {name}",
+                findings.append(_finding("info", "UNDEFINED", f"Check the deferred reference to {name}",
                     "A function or generator references this global name. No notebook definition was found; it is looked up when called.", cell=cell["index"]))
         available.update(cell["defines"])
     ran = [c for c in cells if c["executionCount"] is not None]
@@ -367,32 +502,97 @@ def _python_source(source):
 
 
 def _random_findings(cells, trees):
-    aliases, seeded, findings = {}, set(), []
+    class Calls(ast.NodeVisitor):
+        def __init__(self):
+            self.aliases, self.seeded, self.findings = {}, set(), []
+            self.cell, self.deferred = None, False
+
+        def visit_Import(self, node):
+            self.aliases.update((a.asname or a.name.split('.')[0], a.name if a.asname else a.name.split('.')[0]) for a in node.names)
+
+        def visit_ImportFrom(self, node):
+            self.aliases.update((a.asname or a.name, f'{node.module}.{a.name}') for a in node.names)
+
+        def visit_Call(self, node):
+            self.generic_visit(node)  # Arguments execute before the outer call can seed anything.
+            root, *rest = ast.unparse(node.func).split('.')
+            if root not in self.aliases:
+                return
+            name = '.'.join([self.aliases[root]] + rest)
+            supplied = lambda value: not (isinstance(value, ast.Constant) and value.value is None)
+            seed_keywords = {'seed', 'random_state'} | ({'a'} if name == 'random.seed' else {'x'} if name == 'random.Random' else set())
+            explicit = any(k.arg in seed_keywords and supplied(k.value) for k in node.keywords)
+            arg_seed = bool(node.args and supplied(node.args[0]))
+            seeds = {'random.seed': 'random', 'numpy.random.seed': 'numpy.random',
+                     'torch.manual_seed': 'torch', 'tensorflow.random.set_seed': 'tensorflow.random'}
+            if name in seeds:
+                if arg_seed or explicit:
+                    self.seeded.add(seeds[name])
+                else:
+                    self.seeded.discard(seeds[name])
+                return
+            constructors = {'random.Random', 'numpy.random.default_rng', 'numpy.random.RandomState'}
+            if name in constructors:
+                unseeded = not (explicit or arg_seed)
+            else:
+                draw = name.startswith(('numpy.random.', 'random.', 'torch.rand', 'tensorflow.random.'))
+                draw &= name.rsplit('.', 1)[-1] not in {'getstate', 'setstate', 'get_state', 'set_state', 'Generator', 'BitGenerator'}
+                unseeded = draw and not explicit and not any(name.startswith(s + '.') for s in self.seeded)
+            if unseeded:
+                self.findings.append(_finding('info' if self.deferred else 'warn', 'UNSEEDED_RANDOM',
+                    'Review a random call without a visible earlier seed',
+                    f'{name} has no seed recognised here. Independent generators need their own seed; deferred calls, control flow and aliases need manual review.', cell=self.cell))
+
+        def visit_FunctionDef(self, node):
+            for value in node.decorator_list + node.args.defaults + [v for v in node.args.kw_defaults if v is not None]:
+                self.visit(value)
+            aliases, seeded, deferred = self.aliases.copy(), self.seeded.copy(), self.deferred
+            self.deferred = True
+            for statement in node.body:
+                self.visit(statement)
+            self.aliases, self.seeded, self.deferred = aliases, seeded, deferred
+
+        visit_AsyncFunctionDef = visit_FunctionDef
+
+        def visit_Lambda(self, node):
+            for value in node.args.defaults + [v for v in node.args.kw_defaults if v is not None]:
+                self.visit(value)
+            aliases, seeded, deferred = self.aliases.copy(), self.seeded.copy(), self.deferred
+            self.deferred = True
+            self.visit(node.body)
+            self.aliases, self.seeded, self.deferred = aliases, seeded, deferred
+
+        def visit_If(self, node):
+            self.visit(node.test)
+            if isinstance(node.test, ast.Constant):
+                for statement in node.body if node.test.value else node.orelse:
+                    self.visit(statement)
+                return
+            aliases, seeded = self.aliases.copy(), self.seeded.copy()
+            for statements in (node.body, node.orelse):
+                self.aliases, self.seeded = aliases.copy(), seeded.copy()
+                for statement in statements:
+                    self.visit(statement)
+            self.aliases, self.seeded = aliases, seeded
+
+        def visit_For(self, node):
+            aliases, seeded = self.aliases.copy(), self.seeded.copy()
+            self.generic_visit(node)
+            self.aliases, self.seeded = aliases, seeded
+
+        visit_AsyncFor = visit_For
+        visit_While = visit_For
+        visit_Try = visit_For
+
+    visitor = Calls()
     for cell, tree in zip(cells, trees):
-        if tree is None:
-            continue
-        for node in sorted(ast.walk(tree), key=lambda n: (getattr(n, "lineno", 0), getattr(n, "col_offset", 0))):
-            if isinstance(node, ast.Import):
-                aliases.update((a.asname or a.name.split(".")[0], a.name if a.asname else a.name.split(".")[0]) for a in node.names)
-            elif isinstance(node, ast.ImportFrom):
-                aliases.update((a.asname or a.name, f"{node.module}.{a.name}") for a in node.names)
-            elif isinstance(node, ast.Call):
-                root, *rest = ast.unparse(node.func).split(".")
-                name = ".".join([aliases.get(root, root)] + rest)
-                explicit = any(k.arg in {"seed", "random_state"} and not (isinstance(k.value, ast.Constant) and k.value.value is None) for k in node.keywords)
-                arg_seed = node.args and not (isinstance(node.args[0], ast.Constant) and node.args[0].value is None)
-                if name.endswith((".seed", ".manual_seed", ".set_seed")) and arg_seed:
-                    seeded.add(name.rsplit(".", 1)[0])
-                    continue
-                if name in {"numpy.random.default_rng", "numpy.random.RandomState"} and (explicit or arg_seed):
-                    continue
-                if name.startswith(("numpy.random.", "random.", "torch.rand", "tensorflow.random.")) and not explicit and not any(name.startswith(s + ".") for s in seeded):
-                    findings.append(_finding("warn", "UNSEEDED_RANDOM", "Review a random call without a visible earlier seed",
-                        f"{name} has no seed recognised here. Set the appropriate seed before the draw when repeatability matters; control flow and aliases need manual review.", cell=cell["index"]))
-    return findings
+        if tree is not None:
+            visitor.cell = cell['index']
+            visitor.visit(tree)
+    return visitor.findings
 
 
-def frame(df, *, keys=None, max_rows=None):
+def frame(df, *, keys=None, max_rows=None, rules=None, details=False):
     """Inspect all rows by default; keys declares a unique, possibly composite key.
 
     max_rows limits inspection to the first N rows and is disclosed in the output.
@@ -428,10 +628,80 @@ def frame(df, *, keys=None, max_rows=None):
     key_names = [keys] if isinstance(keys, str) else list(keys) if keys is not None else []
     if any(k not in headers for k in key_names):
         raise ValueError("Every key column must exist in the DataFrame.")
+    declared = _validate_rules(rules, headers)
     report = _analyze_columns(headers, values, masks, len(sample), keys=key_names, dtypes=dtypes)
-    report.update(totalRows=total, truncated=len(sample) < total)
-    _print_table(report)
+    for finding in report['findings']:
+        if finding['code'] in {'MISSING', 'EMPTY_COL', 'DUP_ROWS'}:
+            finding['severity'] = 'info'
+        elif finding['code'] in {'DUP_KEY', 'MISSING_KEY'}:
+            finding['severity'] = 'error'
+    report['findings'].extend(_rule_findings(headers, values, masks, declared))
+    violations = any(f['severity'] == 'error' and (f['code'].startswith('RULE_') or f['code'] in {'DUP_KEY', 'MISSING_KEY'}) for f in report['findings'])
+    skipped = any(f['code'] == 'RULE_SKIPPED' for f in report['findings']) or any(
+        report['columns'][headers.index(name)]['unique'] is None for name in key_names)
+    report.update(totalRows=total, truncated=len(sample) < total, rules=declared, keys=key_names,
+        rulesPassed=False if violations else None if skipped or not len(sample) or not (declared or key_names) else True)
+    report['findings'].sort(key=lambda f: {'error': 0, 'warn': 1, 'info': 2}[f['severity']])
+    _print_table(report, details=details)
     return report
+
+
+def _validate_rules(rules, headers):
+    if rules is None:
+        return {}
+    if not isinstance(rules, dict):
+        raise ValueError('rules must map column names to nullable, unique, min or max rules.')
+    for name, constraints in rules.items():
+        if name not in headers or not isinstance(constraints, dict):
+            raise ValueError('Every rule must refer to an existing column and contain a rule dictionary.')
+        if set(constraints) - {'nullable', 'unique', 'min', 'max'}:
+            raise ValueError('Supported rules are nullable, unique, min and max.')
+        for kind, limit in constraints.items():
+            if kind in {'nullable', 'unique'}:
+                if type(limit) is not bool:
+                    raise ValueError(f'{kind} must be True or False.')
+            elif isinstance(limit, bool) or not isinstance(limit, (Real, Decimal)) or not math.isfinite(limit):
+                raise ValueError(f'{kind} must be a finite number.')
+        if 'min' in constraints and 'max' in constraints and constraints['min'] > constraints['max']:
+            raise ValueError('A min rule cannot exceed its max rule.')
+    return copy.deepcopy(rules)
+
+
+def _rule_findings(headers, values, masks, rules):
+    findings = []
+    for name, constraints in rules.items():
+        index = headers.index(name)
+        present = [(row, value) for row, (value, missing) in enumerate(zip(values[index], masks[index]), 1) if not missing]
+        counts = {}
+        if constraints.get('nullable') is False:
+            counts['NULL'] = ([row for row, missing in enumerate(masks[index], 1) if missing], 'missing values violate nullable=False')
+        if constraints.get('unique'):
+            try:
+                seen, repeated = set(), []
+                for row, value in present:
+                    key = _value_key(value)
+                    if key in seen:
+                        repeated.append(row)
+                    seen.add(key)
+                counts['UNIQUE'] = (repeated, 'repeated non-null values violate unique=True')
+            except (TypeError, ValueError):
+                findings.append(_finding('warn', 'RULE_SKIPPED', f'Uniqueness of {name} could not be checked',
+                    'Unsupported unhashable objects prevent evaluation of the declared unique rule.', column=name))
+        if 'min' in constraints or 'max' in constraints:
+            numeric = [(row, value) for row, value in present if isinstance(value, (Real, Decimal)) and not isinstance(value, bool)]
+            numeric_rows = {row for row, _ in numeric}
+            counts['TYPE'] = ([row for row, _ in present if row not in numeric_rows], 'non-numeric values cannot satisfy a numeric range rule')
+            if 'min' in constraints:
+                counts['MIN'] = ([row for row, value in numeric if value < constraints['min']], f"values are below the declared minimum {constraints['min']}")
+            if 'max' in constraints:
+                counts['MAX'] = ([row for row, value in numeric if value > constraints['max']], f"values are above the declared maximum {constraints['max']}")
+        for kind, (positions, description) in counts.items():
+            if positions:
+                findings.append(_finding('error', 'RULE_' + kind, f'{len(positions)} {description}',
+                    'First affected row positions (1-based): ' + ', '.join(map(str, positions[:10]))
+                    + '. Review these rows or revise the rule if it does not describe the intended data.',
+                    column=name, count=len(positions), rowPositions=positions[:10]))
+    return findings
 
 
 def _value_key(value):
@@ -511,13 +781,13 @@ def _analyze_columns(headers, values, masks, nrows, *, keys=(), dtypes=None):
                 "Decide whether repeated observations are legitimate before removing rows."))
     if keys:
         indexes = [headers.index(k) for k in keys]
+        null_keys = sum(any(masks[i][row] for i in indexes) for row in range(nrows))
+        if null_keys:
+            findings.append(_finding("warn", "MISSING_KEY", f"{null_keys} rows have an incomplete declared key",
+                "Declared key: " + ", ".join(map(str, keys)) + ". Review nulls in these columns."))
         if all(keyed[i] is not None for i in indexes):
             key_rows = list(zip(*(keyed[i] for i in indexes)))
-            null_keys = sum(any(k is None for k in row) for row in key_rows)
             extra = len(key_rows) - len(set(key_rows))
-            if null_keys:
-                findings.append(_finding("warn", "MISSING_KEY", f"{null_keys} rows have an incomplete declared key",
-                    "Declared key: " + ", ".join(map(str, keys)) + ". Review nulls in these columns."))
             if extra:
                 findings.append(_finding("warn", "DUP_KEY", f"{extra} repeated declared keys beyond the first occurrence",
                     "Declared key: " + ", ".join(map(str, keys)) + ". Check the intended grain of the table."))
@@ -568,30 +838,93 @@ def analyze_table(headers, rows, truncated=False):
     return report
 
 
-def _print_findings(report):
+def _print_findings(report, *, details=False):
     if not report["findings"]:
         print("No findings from the checks performed.")
     for f in report["findings"]:
+        if f['severity'] == 'info' and not details:
+            continue
         where = f"  cell {f['cell'] + 1}" if "cell" in f else f"  {f['column']}" if "column" in f else ""
         print(f"{f['severity'].upper():5}  {f['code']}{where}: {f['title']}")
         print(f"       {f['detail']}")
+    info = sum(f['severity'] == 'info' for f in report['findings'])
+    if info and not details:
+        print(f'{info} informational observations retained in the report; use details=True to show them.')
 
 
-def _print_notebook(report):
+def _print_notebook(report, *, details=False):
     print(f"notebookproof: {report['codeCells']} code cells; {len(report['findings'])} findings")
     print(report.get("where", ""))
     print(report["headline"])
-    _print_findings(report)
-    for cell in report["cells"]:
-        print(f"cell {cell['index'] + 1}: writes {', '.join(cell['defines']) or '-'}; reads {', '.join(cell['uses'] + cell['deferred']) or '-'}")
+    _print_findings(report, details=details)
+    if details:
+        for cell in report["cells"]:
+            print(f"cell {cell['index'] + 1}: writes {', '.join(cell['defines']) or '-'}; reads {', '.join(cell['uses'] + cell['deferred']) or '-'}")
 
 
-def _print_table(report):
+def _print_table(report, *, details=False):
     print(f"notebookproof: {report['rows']} checked rows x {report['cols']} columns; {len(report['findings'])} findings")
     if report["truncated"]:
         print(f"Sample only: first {report['rows']} of {report['totalRows']} rows. Later rows were not checked.")
     print(report["headline"])
-    _print_findings(report)
+    if report.get('rulesPassed') is not None:
+        print('Declared rules: ' + ('passed on checked rows' if report['rulesPassed'] else 'violations found'))
+    _print_findings(report, details=details)
+
+
+def save_report(report, path='notebookproof-report.html', *, overwrite=False):
+    """Write a standalone local HTML summary, excluding code and raw output/data values."""
+    if not isinstance(report, dict) or not isinstance(report.get('findings'), list):
+        raise ValueError('Pass a report returned by check() or frame().')
+    file = Path(path).expanduser()
+    if file.suffix.lower() != '.html':
+        raise ValueError('Choose an .html file; original notebook and data files cannot be overwritten.')
+    if type(overwrite) is not bool:
+        raise ValueError('overwrite must be True or False.')
+    if os.environ.get('NOTEBOOKPROOF_VERIFY_ACTIVE') == '1':
+        print('HTML export skipped inside fresh verification; the existing report was not written.')
+        return file.resolve()
+    esc = lambda value: html.escape(str(value), quote=True)
+    findings = report['findings']
+    summary = ', '.join(f"{sum(f['severity'] == kind for f in findings)} {kind}" for kind in ('error', 'warn', 'info'))
+    context = (f"{report['rows']} of {report.get('totalRows', report['rows'])} rows; {report['cols']} columns"
+               if 'rows' in report else f"{report.get('codeCells', 0)} code cells")
+    rows = []
+    for finding in findings:
+        location = f"Cell {finding['cell'] + 1}" if 'cell' in finding else str(finding.get('column', 'Notebook / table'))
+        rows.append('<tr>' + ''.join('<td>' + esc(value) + '</td>' for value in
+            (finding['severity'].upper(), location, finding['title'], finding['detail'])) + '</tr>')
+    execution = report.get('execution')
+    run_section = ''
+    if execution:
+        status = 'Skipped' if execution.get('skipped') else 'Completed' if execution.get('succeeded') else 'Failed'
+        comparison_rows = ''.join('<tr>' + ''.join('<td>' + esc(value) + '</td>' for value in
+            (c['cell'], c['status'], c['detail'])) + '</tr>' for c in execution['outputComparisons'])
+        run_section = f'<h2>Fresh run: {esc(status)}</h2><p>Kernel: {esc(execution.get("kernelName", "not started"))}. Source file after execution: {esc(execution.get("sourceStatus", "not checked"))}. Payload comparison complete: {esc(execution["comparisonComplete"])}.</p><table><thead><tr><th>Cell</th><th>Comparison</th><th>Evidence</th></tr></thead><tbody>{comparison_rows}</tbody></table>'
+    rules_section = ''
+    if report.get('rules') or report.get('keys'):
+        state = 'passed on checked rows' if report['rulesPassed'] is True else 'violations confirmed' if report['rulesPassed'] is False else 'not fully evaluated'
+        rule_items = [str(name) + ': ' + ', '.join(f'{kind}={value}' for kind, value in constraints.items()) for name, constraints in report.get('rules', {}).items()]
+        if report.get('keys'):
+            rule_items.insert(0, 'Unique key: ' + ', '.join(map(str, report['keys'])))
+        rules_section = f'<h2>Declared expectations: {esc(state)}</h2><ul>' + ''.join('<li>' + esc(rule) + '</li>' for rule in rule_items) + '</ul>'
+    dependencies = ''
+    if report.get('cells'):
+        dependency_rows = ''.join('<tr>' + ''.join('<td>' + esc(value) + '</td>' for value in
+            (c['index'] + 1, ', '.join(c['defines']), ', '.join(c['uses']), ', '.join(c['deferred']))) + '</tr>' for c in report['cells'])
+        dependencies = f'<details><summary>Cell dependencies</summary><table><thead><tr><th>Cell</th><th>Writes</th><th>Immediate reads</th><th>Deferred reads</th></tr></thead><tbody>{dependency_rows}</tbody></table></details>'
+    limits = list(report.get('limitations', [])) + (execution.get('limitations', []) if execution else [])
+    if report.get('truncated'):
+        limits.insert(0, 'Only the first requested rows were checked. Later rows were not inspected.')
+    limits.append('This summary omits source code, raw outputs and example data values. Column and variable names and finding descriptions remain; review before sharing.')
+    document = f'''<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Notebookproof report</title><style>
+body{{font:16px/1.6 system-ui,sans-serif;color:#202b37;background:#f6f7f9;margin:0}}main{{max-width:1100px;margin:36px auto;background:white;padding:32px;border:1px solid #d9dfe5;border-radius:12px}}h1,h2{{line-height:1.2}}table{{width:100%;border-collapse:collapse;margin:20px 0}}th,td{{text-align:left;padding:12px;border-bottom:1px solid #d9dfe5;vertical-align:top;overflow-wrap:anywhere}}th{{background:#eef2f6}}summary{{cursor:pointer;font-weight:600}}footer{{font-size:14px;color:#586575}}@media(max-width:700px){{main{{margin:8px;padding:16px}}table{{display:block;overflow-x:auto}}}}</style></head><body><main>
+<h1>Notebookproof report</h1><p>{esc(report.get('headline', 'Inspection evidence'))}</p><p>{esc(context)} · {esc(summary)}</p>
+{run_section}{rules_section}<h2>Findings</h2><table><thead><tr><th>Severity</th><th>Location</th><th>Finding</th><th>Next step / evidence</th></tr></thead><tbody>{''.join(rows) or '<tr><td colspan="4">No findings from the checks performed.</td></tr>'}</tbody></table>{dependencies}
+<h2>Inspection limits</h2><ul>{''.join('<li>' + esc(limit) + '</li>' for limit in limits)}</ul><footer>Generated locally by notebookproof {esc(__version__)}. Matching outputs and satisfied rules do not establish analytical correctness.</footer></main></body></html>'''
+    with file.open('w' if overwrite else 'x', encoding='utf-8') as stream:
+        stream.write(document)
+    return file.resolve()
 
 
 def _load_notebook(path):
@@ -599,15 +932,15 @@ def _load_notebook(path):
         file = Path(path).expanduser()
         if not file.is_file():
             raise FileNotFoundError(f"No notebook at {file}. Save it, then pass the file name.")
-        return json.loads(file.read_text(encoding="utf-8-sig")), f"Read {file.resolve()}. Save first if you just edited it."
+        return json.loads(file.read_text(encoding="utf-8-sig")), f"Read {file.resolve()}. Save first if you just edited it.", file.resolve()
     live = _colab_notebook()
     if live is not None:
-        return live, "Read the live Colab document; execution and live kernel state were not verified."
+        return live, "Read the live Colab document; execution and live kernel state were not verified.", None
     found = _jupyter_notebook_path()
     if found is None:
         raise RuntimeError("The notebook path could not be discovered. Save it, then call notebookproof.check('your-notebook.ipynb'). frame(df) does not need a file.")
     file = Path(found)
-    return json.loads(file.read_text(encoding="utf-8-sig")), f"Read {file.resolve()}. Save first if you just edited it."
+    return json.loads(file.read_text(encoding="utf-8-sig")), f"Read {file.resolve()}. Save first if you just edited it.", file.resolve()
 
 
 def _colab_notebook():

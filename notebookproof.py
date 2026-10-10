@@ -1,6 +1,7 @@
 """Notebook preflight and DataFrame health checks, inside your notebook.
 
-check() inspects saved code. It does not execute cells or prove reproducibility.
+check() inspects saved code; run=True also executes it and compares outputs.
+Matching results do not prove analytical correctness or reproducibility.
 frame(df) inspects actual pandas or Polars values without changing them.
 """
 from __future__ import annotations

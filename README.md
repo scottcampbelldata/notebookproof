@@ -24,6 +24,8 @@ Install the execution extra in your notebook environment:
 %pip install "notebookproof[verify]"
 ```
 
+After upgrading an already imported version, restart the notebook kernel once.
+
 Save the notebook, then run:
 
 ```python
